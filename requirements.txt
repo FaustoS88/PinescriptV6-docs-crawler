@@ -1,0 +1,21 @@
+# Core dependencies
+crawl4ai>=0.4.0
+beautifulsoup4~=4.12
+requests~=2.26
+playwright>=1.49.0
+aiofiles>=24.1.0
+asyncio>=3.4.3
+
+# Processing dependencies
+markdown>=3.4
+python-dotenv~=1.0
+colorama~=0.4
+
+# Optional dependencies for enhanced functionality
+tqdm~=4.65.0  # Progress bars
+pydantic>=2.10  # Data validation
+
+# Additional dependencies for script functionality
+typing  # For type hints (included in Python 3.5+)
+datetime  # Standard library
+re  # Standard library
