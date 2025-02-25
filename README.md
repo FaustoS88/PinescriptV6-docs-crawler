@@ -29,8 +29,8 @@ A Python-based tool for crawling and processing TradingView's Pine Script V6 doc
 
 1. Clone the repository:
    ```bash
-   git clone <repository_url>
-   cd <repository_directory>
+   git clone https://github.com/FaustoS88/PinescriptV6-docs-crawler
+   cd PinescriptV6-docs-crawler
    ```
 
 2. Install required dependencies:
