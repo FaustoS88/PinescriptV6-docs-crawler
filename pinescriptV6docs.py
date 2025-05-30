@@ -9,7 +9,9 @@ from datetime import datetime
 class PineScriptDocsCrawler:
     def __init__(self):
         self.base_url = "https://www.tradingview.com/pine-script-docs"
-        self.output_dir = "pinescript_docs"
+        # Create output directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.output_dir = os.path.join(script_dir, "pinescript_docs")
         self.visited_urls: Set[str] = set()
         
         # Define the extraction schema for structure
@@ -159,12 +161,22 @@ class PineScriptDocsCrawler:
                                 with open(file_path, "w", encoding="utf-8") as f:
                                     f.write(f"# {page_name}\n\n")
                                     f.write(f"Source: {url}\n\n")
-                                    f.write(result.markdown_v2.raw_markdown)
+                                    # Handle both string and MarkdownGenerationResult object
+                                    if isinstance(result.markdown, str):
+                                        content = result.markdown
+                                    else:
+                                        content = result.markdown.raw_markdown if result.markdown else ""
+                                    f.write(content)
                                 
                                 # Add to combined file
                                 combined_file.write(f"\n\n# {page_name}\n\n")
                                 combined_file.write(f"Source: {url}\n\n")
-                                combined_file.write(result.markdown_v2.raw_markdown)
+                                # Handle both string and MarkdownGenerationResult object
+                                if isinstance(result.markdown, str):
+                                    content = result.markdown
+                                else:
+                                    content = result.markdown.raw_markdown if result.markdown else ""
+                                combined_file.write(content)
                                 combined_file.write("\n\n---\n\n")
                                 
                                 success += 1
