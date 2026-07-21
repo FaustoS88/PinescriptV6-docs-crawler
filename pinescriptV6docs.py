@@ -1,221 +1,273 @@
+"""
+pinescriptV6docs.py - Crawl official Pine Script v6 documentation from TradingView.
+
+Improvements:
+  - Overwrites page_name.md instead of accumulating page_name_TIMESTAMP.md files
+  - SHA-256 content hashing with manifest.json (skips unchanged pages unless --force)
+  - Configurable batch size (--batch-size) and rate limiting (--rate-limit)
+  - Removed unused LLMExtractionStrategy
+  - Uses standard logging module
+"""
+
+from __future__ import annotations
+
+import argparse
 import asyncio
-from typing import Set, List
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-from crawl4ai.extraction_strategy import JsonCssExtractionStrategy, LLMExtractionStrategy
-from bs4 import BeautifulSoup
+import hashlib
+import json
+import logging
 import os
-from datetime import datetime
+import sys
+from pathlib import Path
+from typing import List, Set
+
+from bs4 import BeautifulSoup
+from crawl4ai import AsyncWebCrawler, BrowserConfig
+from crawl4ai.extraction_strategy import JsonCssExtractionStrategy
+
+sys.path.insert(0, str(Path(__file__).parent))
+from config import (
+    BASE_URL,
+    DOCS_DIR,
+    MANIFEST_FILE,
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_RATE_LIMIT_SEC,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 
 class PineScriptDocsCrawler:
-    def __init__(self):
-        self.base_url = "https://www.tradingview.com/pine-script-docs"
-        # Create output directory
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.output_dir = os.path.join(script_dir, "pinescript_docs")
+    def __init__(
+        self,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        rate_limit: float = DEFAULT_RATE_LIMIT_SEC,
+        force: bool = False,
+    ):
+        self.base_url = BASE_URL
+        self.output_dir = DOCS_DIR
+        self.batch_size = batch_size
+        self.rate_limit = rate_limit
+        self.force = force
         self.visited_urls: Set[str] = set()
-        
-        # Define the extraction schema for structure
+        self.manifest: dict[str, str] = self._load_manifest()
+
         self.structure_schema = {
             "name": "PineScript Documentation",
-            "baseSelector": "main",  # Main content area
+            "baseSelector": "main",
             "fields": [
-                {
-                    "name": "title",
-                    "selector": "h1",
-                    "type": "text"
-                },
-                {
-                    "name": "content",
-                    "selector": "main > div",  # Main content excluding navigation
-                    "type": "html"
-                },
-                {
-                    "name": "navigation",
-                    "selector": "nav",  # Left navigation menu
-                    "type": "html"
-                },
+                {"name": "title", "selector": "h1", "type": "text"},
+                {"name": "content", "selector": "main > div", "type": "html"},
+                {"name": "navigation", "selector": "nav", "type": "html"},
                 {
                     "name": "toc",
-                    "selector": "[aria-label='Table of contents']",  # Right-side TOC
-                    "type": "html"
-                }
-            ]
-        }
-        
-        # LLM strategy for processing content
-        self.content_schema = {
-            "title": str,
-            "section": str,
-            "content": str,
-            "code_examples": List[str],
-            "related_topics": List[str]
+                    "selector": "[aria-label='Table of contents']",
+                    "type": "html",
+                },
+            ],
         }
 
+    def _load_manifest(self) -> dict[str, str]:
+        if MANIFEST_FILE.exists():
+            try:
+                with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning("Failed to load manifest file: %s", e)
+        return {}
+
+    def _save_manifest(self) -> None:
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.manifest, f, indent=2)
+        except Exception as e:
+            logger.error("Failed to save manifest file: %s", e)
+
+    @staticmethod
+    def _compute_hash(content: str) -> str:
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
     def normalize_url(self, url: str) -> str:
-        """Convert relative URLs to absolute and clean them"""
         if not url:
             return ""
-            
-        # Remove anchor tags and query parameters
-        url = url.split('#')[0].split('?')[0]
-        
-        # Skip external links and special protocols
-        if url.startswith(('http', 'https')) and not url.startswith(self.base_url):
+
+        url = url.split("#")[0].split("?")[0]
+
+        if url.startswith(("http", "https")) and not url.startswith(self.base_url):
             return ""
-        if url.startswith(('mailto:', 'tel:', 'javascript:')):
+        if url.startswith(("mailto:", "tel:", "javascript:")):
             return ""
-            
-        # Handle relative URLs
-        if not url.startswith('http'):
-            if url.startswith('/'):
+
+        if not url.startswith("http"):
+            if url.startswith("/"):
                 url = f"https://www.tradingview.com{url}"
             else:
                 url = f"{self.base_url}/{url}"
-                
+
         return url
 
     async def get_all_doc_urls(self) -> List[str]:
-        """Extract all documentation URLs from the navigation menu"""
         urls = set()
-        print("Starting to collect URLs...")
-        
-        # Start with main sections from left navigation
+        logger.info("Collecting URLs from main page...")
+
         browser_config = BrowserConfig(
             headless=True,
-            extra_args=["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox"]
+            extra_args=["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox"],
         )
-        
+
         async with AsyncWebCrawler(config=browser_config) as crawler:
             result = await crawler.arun(url=f"{self.base_url}/welcome/")
             if result.success:
-                print("Successfully accessed the main page")
-                soup = BeautifulSoup(result.html, 'html.parser')
-                
-                # Find all navigation elements
-                nav_elements = soup.find_all(['nav', 'div'], class_=['toc', 'sidebar'])
+                logger.info("Successfully accessed main welcome page")
+                soup = BeautifulSoup(result.html, "html.parser")
+
+                nav_elements = soup.find_all(["nav", "div"], class_=["toc", "sidebar"])
                 for nav in nav_elements:
-                    for link in nav.find_all('a'):
-                        href = link.get('href')
+                    for link in nav.find_all("a"):
+                        href = link.get("href")
                         if href:
                             full_url = self.normalize_url(href)
                             if full_url:
                                 urls.add(full_url)
-                                print(f"Found URL: {full_url}")
             else:
-                print(f"Failed to access main page: {result.error_message}")
-        
+                logger.error("Failed to access main page: %s", result.error_message)
+
         urls_list = sorted(list(urls))
-        print(f"Total URLs found: {len(urls_list)}")
+        logger.info("Total URLs found: %d", len(urls_list))
         return urls_list
 
     async def crawl_docs(self, urls: List[str]):
-        """Crawl documentation pages with both structure and content extraction"""
-        os.makedirs(self.output_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        print(f"Created output directory: {self.output_dir}")
-        
-        # Configure strategies
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Output directory: %s", self.output_dir)
+
         structure_strategy = JsonCssExtractionStrategy(
-            schema=self.structure_schema,
-            verbose=True
+            schema=self.structure_schema, verbose=False
         )
-        
+
         browser_config = BrowserConfig(
             headless=True,
-            extra_args=["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox"]
+            extra_args=["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox"],
         )
-        
-        # Create files for saving results
-        combined_path = f"{self.output_dir}/all_docs_{timestamp}.md"
-        failed_path = f"{self.output_dir}/failed_urls_{timestamp}.txt"
-        
-        print("Starting crawling process...")
-        
+
+        success = 0
+        skipped = 0
+        failed = 0
+
         async with AsyncWebCrawler(config=browser_config) as crawler:
-            success = 0
-            failed = 0
-            
-            with open(combined_path, "w", encoding="utf-8") as combined_file, \
-                 open(failed_path, "w", encoding="utf-8") as failed_file:
-                
-                # Process in small batches
-                batch_size = 3
-                for i in range(0, len(urls), batch_size):
-                    batch = urls[i:i + batch_size]
-                    print(f"\nProcessing batch {i//batch_size + 1}/{(len(urls) + batch_size - 1)//batch_size}")
-                    
-                    for url in batch:
-                        try:
-                            print(f"Crawling: {url}")
-                            result = await crawler.arun(
-                                url=url,
-                                extraction_strategy=structure_strategy
-                            )
-                            
-                            if result.success:
-                                # Save as individual file
-                                page_name = url.rstrip('/').split('/')[-1] or 'index'
-                                file_path = f"{self.output_dir}/{page_name}_{timestamp}.md"
-                                
-                                with open(file_path, "w", encoding="utf-8") as f:
-                                    f.write(f"# {page_name}\n\n")
-                                    f.write(f"Source: {url}\n\n")
-                                    # Handle both string and MarkdownGenerationResult object
-                                    if isinstance(result.markdown, str):
-                                        content = result.markdown
-                                    else:
-                                        content = result.markdown.raw_markdown if result.markdown else ""
-                                    f.write(content)
-                                
-                                # Add to combined file
-                                combined_file.write(f"\n\n# {page_name}\n\n")
-                                combined_file.write(f"Source: {url}\n\n")
-                                # Handle both string and MarkdownGenerationResult object
-                                if isinstance(result.markdown, str):
-                                    content = result.markdown
-                                else:
-                                    content = result.markdown.raw_markdown if result.markdown else ""
-                                combined_file.write(content)
-                                combined_file.write("\n\n---\n\n")
-                                
-                                success += 1
-                                print(f"Successfully saved: {page_name}")
+            total_batches = (len(urls) + self.batch_size - 1) // self.batch_size
+            for i in range(0, len(urls), self.batch_size):
+                batch = urls[i : i + self.batch_size]
+                logger.info(
+                    "Processing batch %d/%d (%d pages)",
+                    i // self.batch_size + 1,
+                    total_batches,
+                    len(batch),
+                )
+
+                for url in batch:
+                    try:
+                        page_name = url.rstrip("/").split("/")[-1] or "index"
+
+                        result = await crawler.arun(
+                            url=url, extraction_strategy=structure_strategy
+                        )
+
+                        if result.success:
+                            if isinstance(result.markdown, str):
+                                content = result.markdown
                             else:
-                                print(f"Failed to crawl {url}: {result.error_message}")
-                                failed_file.write(f"{url}: {result.error_message}\n")
-                                failed += 1
-                                
-                        except Exception as e:
-                            print(f"Error processing {url}: {str(e)}")
-                            failed_file.write(f"{url}: {str(e)}\n")
+                                content = (
+                                    result.markdown.raw_markdown
+                                    if result.markdown
+                                    else ""
+                                )
+
+                            content_hash = self._compute_hash(content)
+                            file_path = self.output_dir / f"{page_name}.md"
+
+                            if (
+                                not self.force
+                                and self.manifest.get(page_name) == content_hash
+                                and file_path.exists()
+                            ):
+                                logger.info("  [SKIPPED - unchanged] %s", page_name)
+                                skipped += 1
+                                continue
+
+                            with open(file_path, "w", encoding="utf-8") as f:
+                                f.write(f"# {page_name}\n\n")
+                                f.write(f"Source: {url}\n\n")
+                                f.write(content)
+
+                            self.manifest[page_name] = content_hash
+                            success += 1
+                            logger.info("  [SAVED] %s", page_name)
+                        else:
+                            logger.warning(
+                                "Failed to crawl %s: %s", url, result.error_message
+                            )
                             failed += 1
-                    
-                    # Rate limiting between batches
-                    await asyncio.sleep(2)
-        
-        print(f"\nCrawling completed:")
-        print(f"- Successfully crawled: {success} pages")
-        print(f"- Failed: {failed} pages")
-        print(f"\nOutputs saved to:")
-        print(f"- Combined content: {combined_path}")
-        print(f"- Failed URLs: {failed_path}")
-        print(f"- Individual pages: {self.output_dir}/*.md")
+
+                    except Exception as e:
+                        logger.error("Error processing %s: %s", url, e)
+                        failed += 1
+
+                self._save_manifest()
+                if i + self.batch_size < len(urls):
+                    await asyncio.sleep(self.rate_limit)
+
+        logger.info(
+            "Crawling completed: %d saved/updated, %d skipped, %d failed",
+            success,
+            skipped,
+            failed,
+        )
 
     async def run(self):
-        """Main execution method"""
-        print("Starting PineScript documentation crawler...")
+        logger.info("Starting PineScript v6 documentation crawler...")
         urls = await self.get_all_doc_urls()
         if not urls:
-            print("No documentation pages found!")
+            logger.error("No documentation pages found!")
             return
-            
-        print(f"\nFound {len(urls)} documentation pages")
         await self.crawl_docs(urls)
 
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Crawl official Pine Script v6 docs from TradingView."
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Number of pages to crawl per batch (default: {DEFAULT_BATCH_SIZE}).",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=DEFAULT_RATE_LIMIT_SEC,
+        help=f"Delay in seconds between batches (default: {DEFAULT_RATE_LIMIT_SEC}).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-crawling all pages regardless of content hash.",
+    )
+    return parser.parse_args()
+
+
 async def main():
-    crawler = PineScriptDocsCrawler()
+    args = parse_args()
+    crawler = PineScriptDocsCrawler(
+        batch_size=args.batch_size, rate_limit=args.rate_limit, force=args.force
+    )
     await crawler.run()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

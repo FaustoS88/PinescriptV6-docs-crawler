@@ -1,0 +1,36 @@
+name: Refresh Pine Script Docs
+
+on:
+  workflow_dispatch: # Manual trigger from Actions tab
+  # schedule:
+  #   # Optional passive drift check: 1st of every 3rd month at 04:00 UTC (~4 runs/year).
+  #   - cron: "0 4 1 */3 *"
+
+jobs:
+  crawl-and-process:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps
+
+      - name: Crawl docs
+        run: python pinescriptV6docs.py
+
+      - name: Process and chunk
+        run: python process_docs.py
+
+      - name: Commit updated docs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pinescript_docs/
+          git diff --staged --quiet || git commit -m "chore: refresh Pine Script docs $(date +%Y-%m-%d)"
+          git push
